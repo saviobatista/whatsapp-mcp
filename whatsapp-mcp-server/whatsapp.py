@@ -205,6 +205,24 @@ def get_sender_name(sender_jid: str) -> str:
             if 'wconn' in locals():
                 wconn.close()
 
+        # Last resort: the push name the bridge captured off an incoming message.
+        # For group participants who are not in the address book this is the only
+        # place a name exists at all.
+        try:
+            phone_part = sender_jid.split('@')[0]
+            cursor.execute("""
+                SELECT name
+                FROM sender_names
+                WHERE jid = ? OR jid = ?
+                ORDER BY length(jid) DESC
+                LIMIT 1
+            """, (sender_jid, phone_part))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+        except sqlite3.Error:
+            pass
+
         return sender_jid
 
     except sqlite3.Error as e:

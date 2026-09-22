@@ -84,6 +84,12 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE TABLE IF NOT EXISTS sender_names (
+			jid TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			updated_at TIMESTAMP
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -120,6 +126,20 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+	)
+	return err
+}
+
+// Store the display name WhatsApp attaches to an incoming message. Group
+// participants who never messaged us directly are absent from the whatsmeow
+// address book, so this is the only place their name is ever observable.
+func (store *MessageStore) StoreSenderName(jid, name string) error {
+	if jid == "" || name == "" {
+		return nil
+	}
+	_, err := store.db.Exec(
+		"INSERT OR REPLACE INTO sender_names (jid, name, updated_at) VALUES (?, ?, ?)",
+		jid, name, time.Now(),
 	)
 	return err
 }
@@ -203,7 +223,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -228,6 +248,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			Server: "s.whatsapp.net", // For personal chats
 		}
 	}
+
+	// Media descriptors kept out of the media branch so the store call below can see them.
+	var sentMediaType, sentFilename string
 
 	msg := &waProto.Message{}
 
@@ -281,6 +304,18 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			mediaType = whatsmeow.MediaDocument
 			mimeType = "application/octet-stream"
 		}
+
+		switch mediaType {
+		case whatsmeow.MediaImage:
+			sentMediaType = "image"
+		case whatsmeow.MediaAudio:
+			sentMediaType = "audio"
+		case whatsmeow.MediaVideo:
+			sentMediaType = "video"
+		default:
+			sentMediaType = "document"
+		}
+		sentFilename = mediaPath[strings.LastIndex(mediaPath, "/")+1:]
 
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
@@ -346,7 +381,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title: proto.String(filepath.Base(mediaPath)),
+				// Without FileName, WhatsApp shows the attachment as "Unknown".
+				FileName:      proto.String(filepath.Base(mediaPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -362,10 +399,29 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// WhatsApp does not echo a message back to the device that sent it, so a
+	// message sent through this bridge never arrives via the event handler.
+	// Persist it here or it is invisible to every reader of messages.db.
+	chatJID := recipientJID.String()
+	var chatName string
+	messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&chatName)
+	if chatName == "" {
+		chatName = recipientJID.User
+	}
+	if err := messageStore.StoreChat(chatJID, chatName, resp.Timestamp); err != nil {
+		fmt.Printf("Warning: could not store chat for sent message: %v\n", err)
+	}
+	if err := messageStore.StoreMessage(
+		resp.ID, chatJID, client.Store.ID.User, message, resp.Timestamp, true,
+		sentMediaType, sentFilename, "", nil, nil, nil, 0,
+	); err != nil {
+		fmt.Printf("Warning: could not store sent message: %v\n", err)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -413,6 +469,29 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
+
+	// Every incoming message carries the sender's display name. Without capturing
+	// it here it is discarded, and group participants stay unnamed forever.
+	// Business accounts send VerifiedName instead of PushName, and it is the
+	// better name of the two, so it wins when present.
+	senderName := msg.Info.PushName
+	if msg.Info.VerifiedName != nil {
+		if vn := msg.Info.VerifiedName.Details.GetVerifiedName(); vn != "" {
+			senderName = vn
+		}
+	}
+	// Both key shapes are written because this handler stores messages.sender
+	// bare while history sync stores it with the server suffix.
+	if senderName != "" && !msg.Info.IsFromMe {
+		if err := messageStore.StoreSenderName(sender, senderName); err != nil {
+			logger.Warnf("Failed to store sender name: %v", err)
+		}
+		if full := msg.Info.Sender.String(); full != sender {
+			if err := messageStore.StoreSenderName(full, senderName); err != nil {
+				logger.Warnf("Failed to store sender name: %v", err)
+			}
+		}
+	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
@@ -706,7 +785,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
