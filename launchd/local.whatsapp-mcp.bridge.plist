@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: __BRIDGE_DIR__ and __LOG_DIR__ are filled in by the install command in the README. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.whatsapp-mcp.bridge</string>
+  <key>ProgramArguments</key>
+  <array><string>__BRIDGE_DIR__/whatsapp-bridge</string></array>
+  <!-- store/ is resolved relative to the working directory, so this is required. -->
+  <key>WorkingDirectory</key><string>__BRIDGE_DIR__</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>__LOG_DIR__/bridge.log</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/bridge.err.log</string>
+</dict>
+</plist>
